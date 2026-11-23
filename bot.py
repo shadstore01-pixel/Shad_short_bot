@@ -44,7 +44,19 @@ def get_all_symbols():
         and s["contractType"] == "PERPETUAL"
         and s["status"] == "TRADING"
     }
-    tickers = requests.get(f"{BASE}/fapi/v1/ticker/24hr", timeout=20).json()
+    resp2 = requests.get(f"{BASE}/fapi/v1/ticker/24hr", timeout=20)
+    try:
+        tickers = resp2.json()
+    except Exception:
+        tickers = None
+    if not isinstance(tickers, list):
+        # Volume filter not available right now: scan all coins instead
+        if not stats.get("ticker_warned"):
+            stats["ticker_warned"] = True
+            send_telegram(
+                f"⚠️ Volume filter skipped. Binance said: HTTP {resp2.status_code}: {resp2.text[:150]}"
+            )
+        return sorted(allowed)
     result = []
     for t in tickers:
         if t["symbol"] in allowed and float(t["quoteVolume"]) >= MIN_VOLUME:
