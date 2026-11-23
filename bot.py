@@ -16,6 +16,7 @@ DELAY = 0.25               # pause between coins (avoids Binance rate limit)
 
 BASE = "https://fapi.binance.com"
 last_alert = {}
+stats = {"alerts": 0}
 
 
 # ====== TELEGRAM ======
@@ -199,10 +200,12 @@ def check_symbol(symbol):
 
     if bull_tech and last_alert.get((symbol, "bull")) != candle_time:
         last_alert[(symbol, "bull")] = candle_time
+        stats["alerts"] += 1
         send_telegram(f"🟢 BULLISH PULLBACK ALERT ({symbol}, {TIMEFRAME})\n\n{common}")
 
     if bear_tech and last_alert.get((symbol, "bear")) != candle_time:
         last_alert[(symbol, "bear")] = candle_time
+        stats["alerts"] += 1
         send_telegram(
             f"🔴 BEARISH WARNING ({symbol}, {TIMEFRAME})\n"
             f"Price rejected from {level_name}, Open Interest rising\n\n{common}"
@@ -211,23 +214,43 @@ def check_symbol(symbol):
 
 def bot_loop():
     send_telegram("🤖 Bot started! Scanning all Binance USDT futures.")
+    first_scan = True
+    warned = False
     while True:
         try:
             symbols = get_all_symbols()
-            print(f"Total coins: {len(symbols)}")
+            print(f"Total coins: {len(symbols)}", flush=True)
         except Exception as e:
-            print("Symbol list error:", e)
+            print("Symbol list error:", e, flush=True)
+            if not warned:
+                warned = True
+                send_telegram(f"⚠️ Could not get coin list from Binance: {str(e)[:200]}")
             time.sleep(60)
             continue
 
+        errors = 0
+        last_error = ""
+        alerts_before = stats["alerts"]
         for symbol in symbols:
             try:
                 check_symbol(symbol)
             except Exception as e:
-                print(f"Error {symbol}: {e}")
+                errors += 1
+                last_error = f"{symbol}: {e}"
+                print(f"Error {symbol}: {e}", flush=True)
                 if "429" in str(e) or "418" in str(e):
                     time.sleep(60)  # Binance asked us to slow down
             time.sleep(DELAY)
+
+        new_alerts = stats["alerts"] - alerts_before
+        print(f"Scan done. Coins: {len(symbols)}, errors: {errors}, alerts: {new_alerts}", flush=True)
+
+        if first_scan:
+            first_scan = False
+            msg = f"✅ First scan done. Coins checked: {len(symbols)}, alerts: {new_alerts}, errors: {errors}"
+            if errors:
+                msg += f"\nLast error: {last_error[:200]}"
+            send_telegram(msg)
 
         time.sleep(CHECK_EVERY)
 
