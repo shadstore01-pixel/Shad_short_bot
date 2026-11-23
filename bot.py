@@ -1,4 +1,5 @@
 import os
+import re
 import time
 import threading
 import requests
@@ -238,12 +239,18 @@ def bot_loop():
         try:
             symbols = get_all_symbols()
             print(f"Total coins: {len(symbols)}", flush=True)
+            warned = False
         except Exception as e:
             print("Symbol list error:", e, flush=True)
             if not warned:
                 warned = True
                 send_telegram(f"⚠️ Could not get coin list from Binance: {str(e)[:200]}")
-            time.sleep(60)
+            wait = 60
+            m = re.search(r"banned until (\d+)", str(e))
+            if m:
+                remaining = int(m.group(1)) / 1000 - time.time()
+                wait = max(60, min(remaining + 10, 3600))
+            time.sleep(wait)
             continue
 
         errors = 0
@@ -257,7 +264,8 @@ def bot_loop():
                 last_error = f"{symbol}: {e}"
                 print(f"Error {symbol}: {e}", flush=True)
                 if "429" in str(e) or "418" in str(e):
-                    time.sleep(60)  # Binance asked us to slow down
+                    time.sleep(300)  # Binance asked us to slow down: stop this scan and rest
+                    break
             time.sleep(DELAY)
 
         new_alerts = stats["alerts"] - alerts_before
@@ -270,7 +278,7 @@ def bot_loop():
                 msg += f"\nLast error: {last_error[:200]}"
             send_telegram(msg)
 
-        time.sleep(CHECK_EVERY)
+        time.sleep(3600 - (time.time() % 3600) + 45)  # next scan just after the next hourly candle closes
 
 
 # ====== TINY WEB SERVER (keeps Render awake) ======
