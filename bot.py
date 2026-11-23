@@ -30,7 +30,13 @@ def send_telegram(text):
 
 # ====== ALL SYMBOLS ======
 def get_all_symbols():
-    info = requests.get(f"{BASE}/fapi/v1/exchangeInfo", timeout=20).json()
+    resp = requests.get(f"{BASE}/fapi/v1/exchangeInfo", timeout=20)
+    try:
+        info = resp.json()
+    except Exception:
+        raise Exception(f"HTTP {resp.status_code}: {resp.text[:150]}")
+    if "symbols" not in info:
+        raise Exception(f"HTTP {resp.status_code}: {resp.text[:150]}")
     allowed = {
         s["symbol"]
         for s in info["symbols"]
