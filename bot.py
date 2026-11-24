@@ -7,27 +7,44 @@ import requests
 import pandas as pd
 from http.server import BaseHTTPRequestHandler, HTTPServer
 
-# ====== SETTINGS ======
+
+def env_float(name, default):
+    try:
+        return float(os.environ.get(name, default))
+    except ValueError:
+        return float(default)
+
+
+# ====== SETTINGS (can be changed in Render > Environment) ======
 TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN", "")
 CHAT_ID = os.environ.get("CHAT_ID", "")
 
 TIMEFRAME = "1h"
-CHECK_EVERY = 300          # seconds to wait after each full scan
-MIN_VOLUME = 5_000_000     # minimum 24h volume in USDT (set 0 for all coins)
-DELAY = 0.25               # pause between coins (avoids Binance rate limit)
+MIN_VOLUME = env_float("MIN_VOLUME", 5_000_000)         # min 24h volume in USDT
+DELAY = 0.2                                             # pause between coins
+SCAN_EVERY_MINUTES = int(env_float("SCAN_EVERY_MINUTES", 15))  # how often to scan
+USE_LIVE_CANDLE = os.environ.get("USE_LIVE_CANDLE", "1") == "1"  # 1 = use the forming candle
+REQUIRE_UPTREND = os.environ.get("REQUIRE_UPTREND", "1") == "1"  # LONG needs EMA50 > EMA200
+
+MAX_ALERTS_PER_HOUR = int(env_float("MAX_ALERTS_PER_HOUR", 3))   # about 70 per day at most
+MAX_LONG_PER_SCAN = int(env_float("MAX_LONG_PER_SCAN", 2))
+MAX_SHORT_PER_SCAN = int(env_float("MAX_SHORT_PER_SCAN", 1))
+MIN_LONG_SCORE = int(env_float("MIN_LONG_SCORE", 55))
+MIN_SHORT_SCORE = int(env_float("MIN_SHORT_SCORE", 60))
+
+# Trade plan
+ACCOUNT_BALANCE = env_float("ACCOUNT_BALANCE", 100)     # your trading balance in USDT
+RISK_PERCENT = env_float("RISK_PERCENT", 1)             # % of balance risked per trade (NORMAL)
+MAX_LEVERAGE = int(env_float("MAX_LEVERAGE", 20))
+MAX_MARGIN_PERCENT = env_float("MAX_MARGIN_PERCENT", 25)
+SL_ATR_MULT = env_float("SL_ATR_MULT", 1.5)             # stop loss = 1.5 x ATR
+TP1_R = env_float("TP1_R", 1.5)
+TP2_R = env_float("TP2_R", 3)
 
 BASE = "https://fapi.binance.com"
-
-# ====== TRADE PLAN SETTINGS (can be changed in Render > Environment) ======
-ACCOUNT_BALANCE = float(os.environ.get("ACCOUNT_BALANCE", "100"))   # your trading balance in USDT
-RISK_PERCENT = float(os.environ.get("RISK_PERCENT", "1"))           # % of balance you risk per trade
-MAX_LEVERAGE = int(float(os.environ.get("MAX_LEVERAGE", "20")))     # highest leverage the plan may suggest
-MAX_MARGIN_PERCENT = float(os.environ.get("MAX_MARGIN_PERCENT", "25"))  # max % of balance used as margin
-SL_ATR_MULT = float(os.environ.get("SL_ATR_MULT", "1.5"))           # stop loss distance = 1.5 x ATR
-TP1_R = float(os.environ.get("TP1_R", "1.5"))                       # TP1 = 1.5 x risk
-TP2_R = float(os.environ.get("TP2_R", "3"))                         # TP2 = 3 x risk
 last_alert = {}
 stats = {"alerts": 0}
+hour_state = {"hour": -1, "total": 0, "short": 0}
 
 
 # ====== TELEGRAM ======
@@ -36,7 +53,7 @@ def send_telegram(text):
         url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
         requests.post(url, data={"chat_id": CHAT_ID, "text": text}, timeout=15)
     except Exception as e:
-        print("Telegram error:", e)
+        print("Telegram error:", e, flush=True)
 
 
 # ====== ALL SYMBOLS ======
@@ -61,7 +78,6 @@ def get_all_symbols():
     except Exception:
         tickers = None
     if not isinstance(tickers, list):
-        # Volume filter not available right now: scan all coins instead
         if not stats.get("ticker_warned"):
             stats["ticker_warned"] = True
             send_telegram(
@@ -87,7 +103,9 @@ def get_klines(symbol):
     df.columns = ["time", "open", "high", "low", "close", "volume"]
     for c in ["open", "high", "low", "close"]:
         df[c] = df[c].astype(float)
-    return df.iloc[:-1].reset_index(drop=True)  # drop the unfinished candle
+    if not USE_LIVE_CANDLE:
+        df = df.iloc[:-1]  # drop the unfinished candle
+    return df.reset_index(drop=True)
 
 
 def get_oi_trend(symbol):
@@ -174,6 +192,7 @@ def parabolic_sar(high, low, af_step=0.02, af_max=0.2):
     return pd.Series(sar, index=high.index)
 
 
+# ====== TRADE PLAN ======
 def fmt_price(p):
     if p >= 100:
         return f"{p:.2f}"
@@ -212,7 +231,6 @@ def trade_plan(direction, entry, atr_value):
         return "📋 Trade plan not available (volatility too high for this coin)."
 
     sl_pct = risk_dist / entry
-
     text = (
         f"📋 TRADE PLAN ({direction})\n"
         f"Entry: ~{fmt_price(entry)}\n"
@@ -221,7 +239,6 @@ def trade_plan(direction, entry, atr_value):
         f"TP2: {fmt_price(tp2)}\n\n"
         f"Choose your size (balance {ACCOUNT_BALANCE:g} USDT):"
     )
-
     levels = (
         ("🟢 LOW", RISK_PERCENT * 0.5),
         ("🟡 NORMAL", RISK_PERCENT),
@@ -238,7 +255,6 @@ def trade_plan(direction, entry, atr_value):
         )
         if sl_pct * lev > 0.8:
             warn = True
-
     if warn:
         text += "\n\n⚠️ At some sizes the stop loss is close to liquidation. Use lower leverage."
     text += (
@@ -249,11 +265,42 @@ def trade_plan(direction, entry, atr_value):
     return text
 
 
+# ====== SCORING ======
+def long_score(price, ema20, ema50, ema200, atr_v, stk, std, rsi_v):
+    score = 0.0
+    if ema50 > ema200:
+        score += 15                       # bigger trend is up
+    if ema20 > ema50:
+        score += 10                       # short trend is up too
+    score += max(0.0, min(30.0, 30.0 - stk))   # deeper oversold = better
+    if not pd.isna(std) and stk > std:
+        score += 15                       # StochRSI turning up
+    if 40 <= rsi_v <= 65:
+        score += 10                       # pullback not broken
+    if atr_v > 0 and 0 <= (price - ema20) / atr_v <= 1.5:
+        score += 10                       # entry close to EMA20 = better risk/reward
+    return int(round(score))
+
+
+def short_score(ema20, ema50, ema200, stk, rsi_v):
+    score = 40.0
+    if ema50 < ema200:
+        score += 20
+    if ema20 < ema50:
+        score += 15
+    if rsi_v < 50:
+        score += 10
+    if not pd.isna(stk) and stk > 60:
+        score += 15
+    return int(round(score))
+
+
 # ====== MARKET CHECK ======
-def check_symbol(symbol):
+def analyze_symbol(symbol):
+    """Cheap price-based check. Returns a list of candidate signals (no OI yet)."""
     df = get_klines(symbol)
     if len(df) < 210:  # new coin, not enough data for EMA200
-        return
+        return []
     close = df["close"]
     df["ema20"] = ema(close, 20)
     df["ema50"] = ema(close, 50)
@@ -261,7 +308,7 @@ def check_symbol(symbol):
     df["rsi"] = rsi(close)
     df["stk"], df["std"] = stoch_rsi(close)
     df["sar"] = parabolic_sar(df["high"], df["low"])
-    prev_close = df["close"].shift(1)
+    prev_close = close.shift(1)
     tr = pd.concat(
         [df["high"] - df["low"], (df["high"] - prev_close).abs(), (df["low"] - prev_close).abs()],
         axis=1,
@@ -269,58 +316,126 @@ def check_symbol(symbol):
     df["atr"] = tr.ewm(alpha=1 / 14, adjust=False).mean()
 
     row = df.iloc[-1]
+    price = float(row["close"])
     candle_time = int(row["time"])
     atr_v = float(row["atr"])
-    price = row["close"]
+    ema20, ema50, ema200 = float(row["ema20"]), float(row["ema50"]), float(row["ema200"])
+    sar, rsi_v = float(row["sar"]), float(row["rsi"])
+    stk, std = row["stk"], row["std"]
 
-    # Check price conditions first (cheap). Fetch OI / Long-Short only if they match.
-    bull_tech = price > row["ema20"] and price > row["sar"] and row["stk"] < 20
+    base = {
+        "symbol": symbol, "price": price, "atr": atr_v, "candle_time": candle_time,
+        "ema20": ema20, "ema50": ema50, "ema200": ema200,
+        "sar": sar, "rsi": rsi_v, "stk": stk, "std": std,
+    }
+    out = []
 
+    # --- LONG: pullback in an uptrend ---
+    uptrend_ok = ema50 > ema200 or not REQUIRE_UPTREND
+    if (
+        not pd.isna(stk)
+        and price > ema20
+        and price > sar
+        and stk < 30
+        and uptrend_ok
+        and last_alert.get((symbol, "LONG")) != candle_time
+    ):
+        c = dict(base, direction="LONG", level="")
+        c["score"] = long_score(price, ema20, ema50, ema200, atr_v, float(stk), std, rsi_v)
+        if c["score"] >= MIN_LONG_SCORE:
+            out.append(c)
+
+    # --- SHORT: rejection from EMA50 / EMA200 ---
     level_name = ""
-    for name in ["ema50", "ema200"]:
-        lvl = row[name]
-        if row["high"] >= lvl and price < lvl:
-            level_name = name.upper()
+    for name, lvl in (("EMA50", ema50), ("EMA200", ema200)):
+        if float(row["high"]) >= lvl and price < lvl:
+            level_name = name
             break
-    bear_tech = (
-        level_name != ""
-        and price < row["ema20"]
-        and price < row["sar"]
-    )
+    if (
+        level_name
+        and price < ema20
+        and price < sar
+        and last_alert.get((symbol, "SHORT")) != candle_time
+    ):
+        c = dict(base, direction="SHORT", level=level_name)
+        c["score"] = short_score(ema20, ema50, ema200, stk, rsi_v)
+        if c["score"] >= MIN_SHORT_SCORE:
+            out.append(c)
 
-    if not bull_tech and not bear_tech:
-        return
+    return out
 
-    oi, oi_change, oi_rising = get_oi_trend(symbol)
-    if not oi_rising:
-        return
-    ls_ratio, long_acc, short_acc = get_top_ls_ratio(symbol)
 
+def build_message(c, oi, oi_change, ls_ratio, long_acc, short_acc):
+    stk_txt = f"{c['stk']:.2f}" if not pd.isna(c["stk"]) else "n/a"
+    std_txt = f"{c['std']:.2f}" if not pd.isna(c["std"]) else "n/a"
     common = (
-        f"💰 Price: {price}\n"
-        f"📈 EMA20: {row['ema20']:.5f}\n"
-        f"📈 EMA50: {row['ema50']:.5f}\n"
-        f"📈 EMA200: {row['ema200']:.5f}\n"
-        f"🎯 Parabolic SAR: {row['sar']:.5f}\n"
-        f"📊 RSI: {row['rsi']:.2f}\n"
-        f"⚡ StochRSI K: {row['stk']:.2f} | D: {row['std']:.2f}\n"
+        f"💰 Price: {fmt_price(c['price'])}\n"
+        f"📈 EMA20: {c['ema20']:.5f}\n"
+        f"📈 EMA50: {c['ema50']:.5f}\n"
+        f"📈 EMA200: {c['ema200']:.5f}\n"
+        f"🎯 Parabolic SAR: {c['sar']:.5f}\n"
+        f"📊 RSI: {c['rsi']:.2f}\n"
+        f"⚡ StochRSI K: {stk_txt} | D: {std_txt}\n"
         f"📦 Open Interest: {oi:,.0f} ({oi_change:+.2f}% in last 3h)\n"
         f"⚖️ Top Trader Long/Short: {ls_ratio:.2f} "
         f"(Long {long_acc*100:.1f}% / Short {short_acc*100:.1f}%)"
     )
-
-    if bull_tech and last_alert.get((symbol, "bull")) != candle_time:
-        last_alert[(symbol, "bull")] = candle_time
-        stats["alerts"] += 1
-        send_telegram(f"🟢 BULLISH PULLBACK ALERT ({symbol}, {TIMEFRAME})\n\n{common}\n\n{trade_plan('LONG', price, atr_v)}")
-
-    if bear_tech and last_alert.get((symbol, "bear")) != candle_time:
-        last_alert[(symbol, "bear")] = candle_time
-        stats["alerts"] += 1
-        send_telegram(
-            f"🔴 BEARISH WARNING ({symbol}, {TIMEFRAME})\n"
-            f"Price rejected from {level_name}, Open Interest rising\n\n{common}\n\n{trade_plan('SHORT', price, atr_v)}"
+    live = "⏱ Candle still forming (signal may change)\n" if USE_LIVE_CANDLE else ""
+    if c["direction"] == "LONG":
+        head = f"🟢 LONG SIGNAL ({c['symbol']}, {TIMEFRAME}) | Score {c['score']}/100\n{live}\n"
+    else:
+        head = (
+            f"🔴 SHORT WARNING ({c['symbol']}, {TIMEFRAME}) | Score {c['score']}/100\n"
+            f"Price rejected from {c['level']}, Open Interest rising\n{live}\n"
         )
+    return head + common + "\n\n" + trade_plan(c["direction"], c["price"], c["atr"])
+
+
+def pick_and_send(candidates):
+    """Rank candidates, check Open Interest on the best ones, and send the top signals."""
+    hour_key = int(time.time() // 3600)
+    if hour_state["hour"] != hour_key:
+        hour_state.update({"hour": hour_key, "total": 0, "short": 0})
+
+    longs = sorted((c for c in candidates if c["direction"] == "LONG"), key=lambda c: -c["score"])
+    shorts = sorted((c for c in candidates if c["direction"] == "SHORT"), key=lambda c: -c["score"])
+
+    sent = 0
+    lookups = 0
+    for group, limit, direction in (
+        (longs, MAX_LONG_PER_SCAN, "LONG"),
+        (shorts, MAX_SHORT_PER_SCAN, "SHORT"),
+    ):
+        picked = 0
+        for c in group:
+            if picked >= limit or hour_state["total"] >= MAX_ALERTS_PER_HOUR:
+                break
+            if direction == "SHORT" and hour_state["short"] >= 1:
+                break
+            if lookups >= 15:
+                break
+            lookups += 1
+            try:
+                oi, oi_change, rising = get_oi_trend(c["symbol"])
+                if not rising:
+                    continue
+                ls_ratio, long_acc, short_acc = get_top_ls_ratio(c["symbol"])
+            except Exception as e:
+                print(f"OI error {c['symbol']}: {e}", flush=True)
+                if "429" in str(e) or "418" in str(e):
+                    time.sleep(300)
+                    return sent
+                continue
+            send_telegram(build_message(c, oi, oi_change, ls_ratio, long_acc, short_acc))
+            last_alert[(c["symbol"], direction)] = c["candle_time"]
+            picked += 1
+            sent += 1
+            hour_state["total"] += 1
+            if direction == "SHORT":
+                hour_state["short"] += 1
+            stats["alerts"] += 1
+            time.sleep(0.5)
+    return sent
 
 
 def bot_loop():
@@ -341,36 +456,44 @@ def bot_loop():
             m = re.search(r"banned until (\d+)", str(e))
             if m:
                 remaining = int(m.group(1)) / 1000 - time.time()
-                wait = max(60, min(remaining + 10, 3600))
+                wait = max(60, min(remaining + 10, 86400))
             time.sleep(wait)
             continue
 
         errors = 0
         last_error = ""
-        alerts_before = stats["alerts"]
+        candidates = []
         for symbol in symbols:
             try:
-                check_symbol(symbol)
+                candidates.extend(analyze_symbol(symbol))
             except Exception as e:
                 errors += 1
                 last_error = f"{symbol}: {e}"
                 print(f"Error {symbol}: {e}", flush=True)
                 if "429" in str(e) or "418" in str(e):
-                    time.sleep(300)  # Binance asked us to slow down: stop this scan and rest
+                    time.sleep(300)  # Binance asked us to slow down
                     break
             time.sleep(DELAY)
 
-        new_alerts = stats["alerts"] - alerts_before
-        print(f"Scan done. Coins: {len(symbols)}, errors: {errors}, alerts: {new_alerts}", flush=True)
+        sent = pick_and_send(candidates)
+        print(
+            f"Scan done. Coins: {len(symbols)}, candidates: {len(candidates)}, "
+            f"sent: {sent}, errors: {errors}",
+            flush=True,
+        )
 
         if first_scan:
             first_scan = False
-            msg = f"✅ First scan done. Coins checked: {len(symbols)}, alerts: {new_alerts}, errors: {errors}"
+            msg = (
+                f"✅ First scan done. Coins checked: {len(symbols)}, "
+                f"candidates: {len(candidates)}, signals sent: {sent}, errors: {errors}"
+            )
             if errors:
                 msg += f"\nLast error: {last_error[:200]}"
             send_telegram(msg)
 
-        time.sleep(3600 - (time.time() % 3600) + 45)  # next scan just after the next hourly candle closes
+        interval = max(5, SCAN_EVERY_MINUTES) * 60
+        time.sleep(interval - (time.time() % interval) + 20)
 
 
 # ====== TINY WEB SERVER (keeps Render awake) ======
