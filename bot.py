@@ -1,5 +1,6 @@
 import os
 import re
+import math
 import time
 import threading
 import requests
@@ -16,6 +17,15 @@ MIN_VOLUME = 5_000_000     # minimum 24h volume in USDT (set 0 for all coins)
 DELAY = 0.25               # pause between coins (avoids Binance rate limit)
 
 BASE = "https://fapi.binance.com"
+
+# ====== TRADE PLAN SETTINGS (can be changed in Render > Environment) ======
+ACCOUNT_BALANCE = float(os.environ.get("ACCOUNT_BALANCE", "100"))   # your trading balance in USDT
+RISK_PERCENT = float(os.environ.get("RISK_PERCENT", "1"))           # % of balance you risk per trade
+MAX_LEVERAGE = int(float(os.environ.get("MAX_LEVERAGE", "20")))     # highest leverage the plan may suggest
+MAX_MARGIN_PERCENT = float(os.environ.get("MAX_MARGIN_PERCENT", "25"))  # max % of balance used as margin
+SL_ATR_MULT = float(os.environ.get("SL_ATR_MULT", "1.5"))           # stop loss distance = 1.5 x ATR
+TP1_R = float(os.environ.get("TP1_R", "1.5"))                       # TP1 = 1.5 x risk
+TP2_R = float(os.environ.get("TP2_R", "3"))                         # TP2 = 3 x risk
 last_alert = {}
 stats = {"alerts": 0}
 
@@ -164,6 +174,81 @@ def parabolic_sar(high, low, af_step=0.02, af_max=0.2):
     return pd.Series(sar, index=high.index)
 
 
+def fmt_price(p):
+    if p >= 100:
+        return f"{p:.2f}"
+    if p >= 1:
+        return f"{p:.4f}"
+    if p >= 0.01:
+        return f"{p:.5f}"
+    return f"{p:.8f}"
+
+
+def size_for(risk_pct, sl_pct):
+    """Position size, leverage, margin and real risk for a given risk % of balance."""
+    risk_amount = ACCOUNT_BALANCE * risk_pct / 100
+    notional = risk_amount / sl_pct
+    max_margin = ACCOUNT_BALANCE * MAX_MARGIN_PERCENT / 100
+    lev = max(1, math.ceil(notional / max_margin))
+    if lev > MAX_LEVERAGE:
+        lev = MAX_LEVERAGE
+        notional = max_margin * lev
+    margin = notional / lev
+    real_risk = notional * sl_pct
+    return notional, lev, margin, real_risk
+
+
+def trade_plan(direction, entry, atr_value):
+    risk_dist = SL_ATR_MULT * atr_value
+    if direction == "LONG":
+        sl = entry - risk_dist
+        tp1 = entry + TP1_R * risk_dist
+        tp2 = entry + TP2_R * risk_dist
+    else:
+        sl = entry + risk_dist
+        tp1 = entry - TP1_R * risk_dist
+        tp2 = entry - TP2_R * risk_dist
+    if sl <= 0 or tp1 <= 0 or tp2 <= 0 or risk_dist <= 0:
+        return "📋 Trade plan not available (volatility too high for this coin)."
+
+    sl_pct = risk_dist / entry
+
+    text = (
+        f"📋 TRADE PLAN ({direction})\n"
+        f"Entry: ~{fmt_price(entry)}\n"
+        f"Stop Loss: {fmt_price(sl)} ({sl_pct*100:.2f}% from entry)\n"
+        f"TP1: {fmt_price(tp1)}\n"
+        f"TP2: {fmt_price(tp2)}\n\n"
+        f"Choose your size (balance {ACCOUNT_BALANCE:g} USDT):"
+    )
+
+    levels = (
+        ("🟢 LOW", RISK_PERCENT * 0.5),
+        ("🟡 NORMAL", RISK_PERCENT),
+        ("🔴 HIGH", RISK_PERCENT * 2),
+    )
+    warn = False
+    for name, rp in levels:
+        notional, lev, margin, real_risk = size_for(rp, sl_pct)
+        text += (
+            f"\n\n{name} (risk {rp:g}%)\n"
+            f"Position: {notional:.2f} USDT | Leverage: {lev}x | Margin: {margin:.2f} USDT\n"
+            f"Loss at SL: -{real_risk:.2f} USDT\n"
+            f"Profit: TP1 +{real_risk*TP1_R:.2f} | TP2 +{real_risk*TP2_R:.2f} USDT"
+        )
+        if sl_pct * lev > 0.8:
+            warn = True
+
+    if warn:
+        text += "\n\n⚠️ At some sizes the stop loss is close to liquidation. Use lower leverage."
+    text += (
+        "\n\nYou can enter with less or more. Loss at SL depends on POSITION size, "
+        "not on leverage. Higher leverage only lowers the margin and moves liquidation closer."
+        "\nThis is a plan, not financial advice. Always set the stop loss."
+    )
+    return text
+
+
 # ====== MARKET CHECK ======
 def check_symbol(symbol):
     df = get_klines(symbol)
@@ -176,9 +261,16 @@ def check_symbol(symbol):
     df["rsi"] = rsi(close)
     df["stk"], df["std"] = stoch_rsi(close)
     df["sar"] = parabolic_sar(df["high"], df["low"])
+    prev_close = df["close"].shift(1)
+    tr = pd.concat(
+        [df["high"] - df["low"], (df["high"] - prev_close).abs(), (df["low"] - prev_close).abs()],
+        axis=1,
+    ).max(axis=1)
+    df["atr"] = tr.ewm(alpha=1 / 14, adjust=False).mean()
 
     row = df.iloc[-1]
     candle_time = int(row["time"])
+    atr_v = float(row["atr"])
     price = row["close"]
 
     # Check price conditions first (cheap). Fetch OI / Long-Short only if they match.
@@ -220,14 +312,14 @@ def check_symbol(symbol):
     if bull_tech and last_alert.get((symbol, "bull")) != candle_time:
         last_alert[(symbol, "bull")] = candle_time
         stats["alerts"] += 1
-        send_telegram(f"🟢 BULLISH PULLBACK ALERT ({symbol}, {TIMEFRAME})\n\n{common}")
+        send_telegram(f"🟢 BULLISH PULLBACK ALERT ({symbol}, {TIMEFRAME})\n\n{common}\n\n{trade_plan('LONG', price, atr_v)}")
 
     if bear_tech and last_alert.get((symbol, "bear")) != candle_time:
         last_alert[(symbol, "bear")] = candle_time
         stats["alerts"] += 1
         send_telegram(
             f"🔴 BEARISH WARNING ({symbol}, {TIMEFRAME})\n"
-            f"Price rejected from {level_name}, Open Interest rising\n\n{common}"
+            f"Price rejected from {level_name}, Open Interest rising\n\n{common}\n\n{trade_plan('SHORT', price, atr_v)}"
         )
 
 
